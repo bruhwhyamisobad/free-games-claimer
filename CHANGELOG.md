@@ -4,6 +4,29 @@ Release notes for [Feldorn's Free Games Claimer](README.md). Most recent at the 
 
 ---
 
+## What's new in 2.12.5
+
+**Fix: Tier-2 auto-dismiss now actually clears one-off script errors.**
+
+Since v2.8.78 shipped the "transient-likely" diagnostic filter, the recorder has looked up the wrong key when deciding whether an error's service had prior success:
+
+- Scanner picks `script` from the log-header regex (`─── Epic Games (v2.2) ──`) → display name `"Epic Games"`.
+- `_recordDiagnosticError` then read `lastRunSuccess["epic games"]` (lowercased display name).
+- But `lastRunSuccess` and every `sites.js` registry entry are keyed by the kebab-case id `"epic-games"`.
+
+Result: every fresh single-occurrence error recorded since v2.8.78 got `transientLikely: false`, the banner-suppression + auto-dismiss on next-success path never fired, and every count-1 script blip has sat in the Diagnostics/Alerts list until the user manually shared or dismissed it. In @feldorn's DB an Epic Games `page.goto: Timeout 60000ms exceeded` from 2026-08-28 was still showing 30 days later despite ~30 clean Epic runs in the meantime.
+
+**Fix:**
+
+1. **Resolver.** New `_resolveSiteIdFromScript()` walks `SITE_REGISTRY` (< 20 rows) and returns the site id for a display-name or id string. Called from both the recorder and the sweep.
+2. **Recorder.** `_recordDiagnosticError` now stores the resolved `siteId` on new entries and backfills it on existing ones, so future lookups don't depend on the display-name string round-trip.
+3. **Sweep.** `_sweepTransientDiagnostics` matches by `entry.siteId` (with the resolver as a legacy fallback), so it actually finds the entries recorded for the site that just succeeded.
+4. **One-time boot cleanup.** New `_sweepStaleUndecidedDiagnostics()` runs after diagnostics load: any undecided count-1 entry whose resolved site has a `lastRunSuccess` timestamp AFTER `firstSeen` is swept and logged. This purges the historical accumulation from the pre-fix window without waiting for the next occurrence of each dead fingerprint. Idempotent — safe to keep running on every boot.
+
+Only sweeps count-1 undecided entries where a later success is on record for the same site; anything the user has acted on (Share / Dismiss / etc.) and anything with count ≥ 2 (real recurring signal) stays put.
+
+---
+
 ## What's new in 2.12.4
 
 **Fix: `PG_RETRY_PENDING` retries now heal codes MS rejects at client-side validation.**

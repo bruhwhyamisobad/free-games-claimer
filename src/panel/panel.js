@@ -912,6 +912,25 @@ function _captureErrorContext() {
   }
 }
 
+// The scanner pulls `script` from the ─── Section (v2.x) ─── log header,
+// which is the display name ("Epic Games", "Prime Gaming"). lastRunSuccess
+// and the sites.js registry key on the site id ("epic-games"). Resolve one
+// to the other so Tier-2 auto-dismiss actually matches. Legacy entries
+// stored the display name in `script` with no `siteId` — the resolver
+// covers those by walking the registry once per call (registry is <20 rows,
+// cost is negligible). Returns null if nothing matches; callers must
+// tolerate that (services with idiosyncratic headers, or entries recorded
+// before their site existed in the registry).
+function _resolveSiteIdFromScript(script) {
+  if (!script) return null;
+  const key = String(script).trim().toLowerCase();
+  for (const s of SITE_REGISTRY) {
+    if (String(s.name || '').toLowerCase() === key) return s.id;
+    if (String(s.id || '').toLowerCase() === key) return s.id;
+  }
+  return null;
+}
+
 function _recordDiagnosticError(script, errorClass, message, stackLines) {
   if (!diagnosticsDb || !diagnosticsDb.data) return; // not loaded yet
   if (!diagnosticsDb.data.enabled) return;            // user opted out via Never Share
@@ -935,11 +954,12 @@ function _recordDiagnosticError(script, errorClass, message, stackLines) {
   // Two ways an entry loses the tag: (a) it recurs (count >= 2) — see
   // else branch below, which promotes it to a real error; (b) the same
   // service runs successfully again — swept in recordLastRunSuccess.
-  const siteKey = (script || '').toLowerCase();
-  const priorSuccess = siteKey && lastRunSuccess && lastRunSuccess[siteKey];
+  const siteId = _resolveSiteIdFromScript(script);
+  const priorSuccess = siteId && lastRunSuccess && lastRunSuccess[siteId];
   if (!errors[fp]) {
     errors[fp] = {
       script: script || 'unknown',
+      siteId: siteId || null,
       errorClass: errorClass || 'Error',
       message: message.slice(0, 500),
       stack: Array.isArray(redactedStack) ? redactedStack.slice(0, 50).join('\n').slice(0, 6000) : '',
@@ -953,6 +973,7 @@ function _recordDiagnosticError(script, errorClass, message, stackLines) {
   } else {
     errors[fp].lastSeen = nowIso;
     errors[fp].count = (errors[fp].count || 0) + 1;
+    if (siteId && !errors[fp].siteId) errors[fp].siteId = siteId; // backfill legacy
     if (Array.isArray(redactedStack) && redactedStack.length) {
       errors[fp].stack = redactedStack.slice(0, 50).join('\n').slice(0, 6000);
     }
@@ -2182,13 +2203,48 @@ function _sweepTransientDiagnostics(siteId) {
     const e = errs[fp];
     if (!e || !e.transientLikely) continue;
     if (e.decided) continue; // user acted — leave it
-    if (String(e.script || '').toLowerCase() !== target) continue;
+    const entrySiteId = e.siteId || _resolveSiteIdFromScript(e.script);
+    if (String(entrySiteId || '').toLowerCase() !== target) continue;
     delete errs[fp];
     removed++;
   }
   if (removed) {
     diagnosticsDb.write().catch(err => console.warn(`[${datetime()}] diagnostics-state sweep write failed: ${err.message}`));
     console.log(`[${datetime()}] Diagnostics: auto-dismissed ${removed} transient-likely error${removed === 1 ? '' : 's'} after ${siteId} success.`);
+  }
+}
+
+// v2.12.5 one-time cleanup for entries that accumulated while the Tier-2
+// name-to-id resolution bug was live (v2.8.78 → v2.12.4). Any undecided
+// count-1 entry whose resolved site has a successful run recorded AFTER
+// firstSeen was a "would-have-been transient" entry — sweep it now so the
+// Alerts / Diagnostics list is not permanently polluted. Skips entries the
+// user has acted on (decided) and entries with count >= 2 (real recurring).
+function _sweepStaleUndecidedDiagnostics() {
+  if (!diagnosticsDb || !diagnosticsDb.data || !diagnosticsDb.data.errors) return;
+  const errs = diagnosticsDb.data.errors;
+  const swept = [];
+  for (const fp of Object.keys(errs)) {
+    const e = errs[fp];
+    if (!e || e.decided) continue;
+    if ((e.count || 0) !== 1) continue;
+    const entrySiteId = e.siteId || _resolveSiteIdFromScript(e.script);
+    if (!entrySiteId) continue;
+    const successAt = lastRunSuccess && lastRunSuccess[entrySiteId];
+    if (!successAt) continue;
+    const firstSeenMs = Date.parse(e.firstSeen);
+    // lastRunSuccess is "YYYY-MM-DD HH:MM:SS" (local slice) — replace the
+    // space with T so Date.parse treats it as ISO-ish. Fall through on
+    // any non-finite conversion (defensive).
+    const successMs = Date.parse(String(successAt).replace(' ', 'T'));
+    if (!isFinite(firstSeenMs) || !isFinite(successMs)) continue;
+    if (successMs <= firstSeenMs) continue;
+    delete errs[fp];
+    swept.push(`${e.script || entrySiteId} (fp=${fp.slice(0, 8)})`);
+  }
+  if (swept.length) {
+    diagnosticsDb.write().catch(err => console.warn(`[${datetime()}] diagnostics-state stale-sweep write failed: ${err.message}`));
+    console.log(`[${datetime()}] Diagnostics: swept ${swept.length} stale undecided error${swept.length === 1 ? '' : 's'} superseded by later success (${swept.join(', ')}).`);
   }
 }
 loadLastRuns();
@@ -11111,6 +11167,13 @@ server.listen(PANEL_PORT, async () => {
   // hits during the auto-session-check warm-up.
   try { await loadDiagnosticsDb(); }
   catch (e) { console.error(`[${datetime()}] failed to load diagnostics-state.json: ${e.message}`); }
+  // v2.12.5: one-time cleanup for undecided count-1 entries that accumulated
+  // while Tier-2 auto-dismiss was broken (display-name-vs-site-id mismatch,
+  // v2.8.78 → v2.12.4). Runs on every boot but only touches entries where a
+  // later success clearly self-healed the fingerprint, so it's idempotent
+  // and safe to keep long-term.
+  try { _sweepStaleUndecidedDiagnostics(); }
+  catch (e) { console.error(`[${datetime()}] stale-diagnostics sweep failed: ${e.message}`); }
 
   console.log(`[${datetime()}] Free Games Claimer ${APP_VERSION ? 'v' + APP_VERSION + ' ' : ''}— panel + scheduler`);
   // Auth-mode banner (v2.11.12) — makes it obvious at boot which path is
