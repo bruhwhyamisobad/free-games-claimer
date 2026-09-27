@@ -135,6 +135,123 @@ try {
   // visible is to re-include them in every run's notification until status flips to
   // "redeemed" / "expired" / "invalid". Reconciliation against the actual GOG library
   // happens in gog.js (it has the authenticated session).
+  // v2.12.3 (feldorn 2026-09-27, #155 followup): MS Store redemption
+  // helper. Extracted so both the main "Prime just got a new code" flow
+  // AND the PG_RETRY_PENDING retry loop can share one implementation.
+  //
+  // The MS Store UI moved from `store-web.dynamics.com/v1.0/Redeem/*` API
+  // calls to a fully client-side React app served from
+  // `www.microsoft.com/store/purchase/buynowui/*`. There are no network
+  // endpoints to hook — the redemption state is signalled entirely by
+  // the iframe URL transitioning between:
+  //     redeemnow        → input page (tokenString + disabled Next)
+  //     redeem-confirm   → product info + Cancel / Confirm buttons
+  //     redeem-success   → "You're good to go" + "X is ready for you"
+  //     redeem-error/    → error state (label unobserved, defensive)
+  //     redeem-fail/     → ditto
+  //
+  // Investigated 2026-09-27 by driving the full flow with feldorn's
+  // DOOM Eternal code — full network + UI capture in
+  // data/mstore-investigate-report.txt. Success confirmed live.
+  //
+  // Returns: { action, dbStatus?, logLevel, message }
+  //   action     — the redeem_action string surfaced in run summary
+  //   dbStatus   — optional new DB status for the entry (only when known)
+  //   logLevel   — 'ok' | 'warn'
+  //   message    — human-readable outcome, appended to log line
+  //
+  // Contract: caller has ALREADY navigated page2 to the redemption URL
+  // (or a login redirect check has been handled upstream). This function
+  // only fills the code + drives the Next → Confirm flow.
+  async function attemptMsStoreRedeem(page2, code) {
+    try {
+      const iframe = page2.frameLocator('#redeem-iframe');
+      const input = iframe.locator('[name=tokenString]');
+      await input.waitFor({ timeout: 20000 });
+      await input.fill(code);
+      // Client-side validation runs on fill — Next enables when the code
+      // parses as a well-formed key (25 chars, checksum ok). If it never
+      // enables, the code is malformed OR the input didn't take.
+      const nextBtn = iframe.locator('button:has-text("Next"):not([disabled])');
+      try {
+        await nextBtn.waitFor({ timeout: 10000 });
+      } catch {
+        return { action: 'redeem (validation failed)', logLevel: 'warn', message: 'MS Store client-side validation rejected the code within 10s' };
+      }
+      await nextBtn.click();
+      // Wait for iframe to transition to a terminal sub-slug.
+      const findSub = () => {
+        for (const f of page2.frames()) {
+          if (f === page2.mainFrame()) continue;
+          const u = f.url();
+          const m = /\/store\/purchase\/buynowui\/(redeem-[a-z0-9-]+|redeemnow)/i.exec(u);
+          if (m) return { frame: f, slug: m[1].toLowerCase() };
+        }
+        return null;
+      };
+      // Poll for a slug transition away from redeemnow — up to 20s.
+      const t0 = Date.now();
+      let phase = null;
+      while (Date.now() - t0 < 20000) {
+        const s = findSub();
+        if (s && s.slug !== 'redeemnow') { phase = s; break; }
+        await page2.waitForTimeout(400);
+      }
+      if (!phase) {
+        return { action: 'redeem (stuck at Next)', logLevel: 'warn', message: 'iframe didn\'t transition past redeemnow within 20s after Next click' };
+      }
+      // Handle each terminal state.
+      if (phase.slug === 'redeem-success') {
+        // Skipped straight to success — happens for codes MS already
+        // knows are consumed / associated with the account (rare).
+        return { action: 'already redeemed', dbStatus: 'claimed and redeemed', logLevel: 'ok', message: 'already-redeemed shortcut (Next → redeem-success)' };
+      }
+      if (/redeem-(err|fail|invalid|expired)/i.test(phase.slug)) {
+        // Try to grab any error text for the log.
+        let errText = '';
+        try { errText = (await iframe.locator('body').innerText({ timeout: 2000 })).slice(0, 120); } catch { /* best-effort */ }
+        const lower = errText.toLowerCase();
+        if (lower.includes('already') || lower.includes('own')) {
+          return { action: 'already redeemed', dbStatus: 'claimed and redeemed', logLevel: 'ok', message: `already owned (${phase.slug})` };
+        }
+        return { action: 'redeem (rejected)', dbStatus: 'claimed:token-invalid', logLevel: 'warn', message: `MS Store rejected the code at ${phase.slug}: ${errText || '(no error text)'}` };
+      }
+      if (phase.slug === 'redeem-confirm') {
+        // Standard path — click Confirm to finalize.
+        const confirmBtn = iframe.locator('button:has-text("Confirm"):not([disabled])').first();
+        try {
+          await confirmBtn.waitFor({ timeout: 8000 });
+        } catch {
+          return { action: 'redeem (Confirm missing)', logLevel: 'warn', message: 'reached redeem-confirm but Confirm button never appeared within 8s' };
+        }
+        await confirmBtn.click();
+        // Wait for final slug transition. Success = redeem-success.
+        const t1 = Date.now();
+        let final = null;
+        while (Date.now() - t1 < 30000) {
+          const s = findSub();
+          if (s && s.slug !== 'redeem-confirm') { final = s; break; }
+          await page2.waitForTimeout(400);
+        }
+        if (!final) {
+          return { action: 'redeem', dbStatus: 'claimed and redeemed?', logLevel: 'warn', message: 'submitted Confirm but iframe didn\'t transition to a terminal slug within 30s' };
+        }
+        if (final.slug === 'redeem-success') {
+          return { action: 'redeemed', dbStatus: 'claimed and redeemed', logLevel: 'ok', message: 'claimed and redeemed' };
+        }
+        // Post-Confirm error slug.
+        let errText = '';
+        try { errText = (await iframe.locator('body').innerText({ timeout: 2000 })).slice(0, 120); } catch { /* best-effort */ }
+        return { action: 'redeem (post-confirm error)', dbStatus: 'claimed and redeemed?', logLevel: 'warn', message: `post-Confirm state ${final.slug}: ${errText || '(no error text)'}` };
+      }
+      // Unrecognized slug — leave for manual verification.
+      return { action: 'redeem (unknown slug)', dbStatus: 'claimed and redeemed?', logLevel: 'warn', message: `iframe transitioned to unrecognized slug ${phase.slug}` };
+    } catch (e) {
+      if (cfg.debug) console.debug(`  attemptMsStoreRedeem exception: ${String(e.message || e).split('\n')[0]}`);
+      return { action: 'redeem', logLevel: 'warn', message: 'exception during MS Store flow — redeem manually' };
+    }
+  }
+
   const keyStores = new Set(['gog.com', 'microsoft store', 'xbox']);
   const redeemBaseUrls = {
     'gog.com': 'https://www.gog.com/redeem',
@@ -169,6 +286,62 @@ try {
     if (cutoffMs && entry.time && Date.parse(entry.time) < cutoffMs) { hiddenByAge++; continue; }
     if (isAutoRetryingGogCode(entry)) { hiddenByRetry++; continue; }
     pending.push({ dbTitle, entry });
+  }
+  // v2.12.3 (feldorn 2026-09-27): PG_RETRY_PENDING self-heal. When set,
+  // MS Store / Xbox pending entries in the DB — codes fgc captured from
+  // Prime but never confirmed redeemed externally — get re-attempted via
+  // the new attemptMsStoreRedeem helper on THIS run. Successful retries
+  // flip status to 'claimed and redeemed' (terminal, drops from pending
+  // notify list). Rejected codes get 'claimed:token-invalid' (also
+  // terminal). Anything ambiguous stays 'claimed' and shows up in the
+  // next daily reminder.
+  //
+  // GOG entries are already handled by gog.js's cross-run retry loop
+  // (via redeemAttempts counter) — skip them here.
+  //
+  // Runs BEFORE the notify_pending push below so successful retries don't
+  // fire a "pending" notification when they're actually done.
+  if (cfg.pg_retry_pending && pending.length) {
+    log.status('PG_RETRY_PENDING', `${pending.length} pending code(s) — re-attempting external redemption`);
+    let retried = 0, healed = 0, stillPending = 0;
+    // Iterate in-place; each retry may update entry.status → the terminalRx
+    // check at line 285 already excluded terminal, so no double-processing.
+    for (let i = pending.length - 1; i >= 0; i--) {
+      const { dbTitle, entry } = pending[i];
+      if (entry.store !== 'microsoft store' && entry.store !== 'xbox') continue;
+      retried++;
+      const base = redeemBaseUrls[entry.store];
+      log.info(`  retrying ${dbTitle} on ${entry.store}...`);
+      const page2 = await context.newPage();
+      try {
+        await page2.goto(base, { waitUntil: 'domcontentloaded' });
+        if (page2.url().startsWith('https://login.')) {
+          log.warn(`  ${dbTitle} — login redirect during retry, skipping`);
+          continue;
+        }
+        const out = await attemptMsStoreRedeem(page2, entry.code);
+        if (out.dbStatus) {
+          db.data[user][dbTitle].status = out.dbStatus;
+          // Terminal statuses (contain 'redeemed' or 'invalid') will be
+          // filtered out of pending on next iteration + next run.
+          if (terminalRx.test(out.dbStatus)) {
+            healed++;
+            log.ok(`  ${dbTitle} — ${out.message}`);
+            pending.splice(i, 1); // drop from THIS run's notify list too
+            continue;
+          }
+        }
+        stillPending++;
+        log.warn(`  ${dbTitle} — retry didn't resolve: ${out.message}`);
+      } catch (e) {
+        stillPending++;
+        log.warn(`  ${dbTitle} — retry error: ${String(e.message || e).split('\n')[0]}`);
+      } finally {
+        await page2.close().catch(() => {});
+      }
+    }
+    log.status('PG_RETRY_PENDING', `${retried} retried, ${healed} healed, ${stillPending} still pending`);
+    await db.write().catch(() => {});
   }
   if (pending.length) {
     const filterNotes = [];
@@ -451,70 +624,11 @@ try {
               log.warn(`${title} — login required on ${store}, redeem manually`);
               await page2.waitForTimeout(60 * 1000); // give user chance to log in
             } else {
-              // v2.11.19 (feldorn 2026-09-18 DOOM Eternal): the two
-              // waitForResponse calls below used to throw unhandled on
-              // timeout, killing the whole Prime run and surfacing a
-              // diagnostic banner that required manual dismissal. Wrap
-              // both in try/catch so a stuck MS-Store handoff logs
-              // cleanly, leaves redeem_action at its default 'redeem'
-              // (which the needsManual tally at line ~505 already
-              // handles as "user must redeem manually"), and lets
-              // control fall through to page2.close() + summary
-              // as normal. Concrete case: DOOM Eternal 2026-09-18 —
-              // PrepareRedeem endpoint didn't fire in 60s. Could be
-              // transient MS backend, or MS quietly shifting away from
-              // store-web.dynamics.com toward redeem.microsoft.com /
-              // xbox.com/redeem. Either way, one stuck code should not
-              // torpedo the batch.
-              try {
-                const iframe = page2.frameLocator('#redeem-iframe');
-                const input = iframe.locator('[name=tokenString]');
-                await input.waitFor();
-                await input.fill(code);
-                const r = page2.waitForResponse(r => r.url().startsWith('https://cart.production.store-web.dynamics.com/v1.0/Redeem/PrepareRedeem'));
-                const rt = await (await r).text();
-                const j = JSON.parse(rt);
-                const reason = j?.events?.cart.length && j.events.cart[0]?.data?.reason;
-                if (reason == 'TokenNotFound') {
-                  redeem_action = 'redeem (not found)';
-                  log.warn(`${title} — code not found on ${store}`);
-                } else if (j?.productInfos?.length && j.productInfos[0]?.redeemable) {
-                  await iframe.locator('button:has-text("Next")').click();
-                  await iframe.locator('button:has-text("Confirm")').click();
-                  try {
-                    const r = page2.waitForResponse(r => r.url().startsWith('https://cart.production.store-web.dynamics.com/v1.0/Redeem/RedeemToken'));
-                    const j = JSON.parse(await (await r).text());
-                    if (j?.events?.cart.length && j.events.cart[0]?.data?.reason == 'UserAlreadyOwnsContent') {
-                      redeem_action = 'already redeemed';
-                      log.ok(`${title} — already owned on ${store}`);
-                    } else {
-                      redeem_action = 'redeemed';
-                      db.data[user][title].status = 'claimed and redeemed?';
-                      log.ok(`${title} — claimed and redeemed on ${store} (unconfirmed)`);
-                    }
-                  } catch (e) {
-                    // RedeemToken timed out AFTER Next+Confirm were
-                    // clicked — the redemption may or may not have
-                    // gone through. Mark unconfirmed and surface for
-                    // manual verification.
-                    log.warn(`${title} — MS Store RedeemToken didn't respond in 60s after Confirm click — verify manually at ${redeem_url}`);
-                    if (cfg.debug) console.debug(`  Exception: ${String(e.message || e).split('\n')[0]}`);
-                    // Leave redeem_action = 'redeem' (default) so the
-                    // manual-action tally + notify fires.
-                  }
-                } else {
-                  redeem_action = 'unknown';
-                  if (cfg.debug) console.debug(`  Response: ${rt}`);
-                  log.warn(`${title} — unknown redeem response on ${store} (please report: issues/5)`);
-                }
-              } catch (e) {
-                // PrepareRedeem timed out (or one of the earlier iframe
-                // steps threw). Nothing was submitted — clean fall-through
-                // with default redeem_action = 'redeem' so the tally
-                // treats it as "user must redeem manually".
-                log.warn(`${title} — MS Store PrepareRedeem endpoint didn't respond in 60s — redeem manually at ${redeem_url}`);
-                if (cfg.debug) console.debug(`  Exception: ${String(e.message || e).split('\n')[0]}`);
-              }
+              const out = await attemptMsStoreRedeem(page2, code);
+              redeem_action = out.action;
+              if (out.dbStatus) db.data[user][title].status = out.dbStatus;
+              if (out.logLevel === 'ok')   log.ok(`${title} — ${out.message} on ${store}`);
+              if (out.logLevel === 'warn') log.warn(`${title} — ${out.message} on ${store}${out.message.includes('manually') ? '' : ' — verify manually at ' + redeem_url}`);
             }
           } else if (store == 'legacy games') {
             // Legacy Games' redeem form requires an email. cfg.lg_email

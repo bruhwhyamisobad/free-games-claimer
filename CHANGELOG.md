@@ -4,6 +4,39 @@ Release notes for [Feldorn's Free Games Claimer](README.md). Most recent at the 
 
 ---
 
+## What's new in 2.12.3
+
+**Feature: MS Store / Xbox Prime-code auto-redemption rewritten against the current UI + new `PG_RETRY_PENDING=1` self-heal flag.**
+
+Long-standing pattern where fgc captured a Prime-provided MS Store code (e.g. DOOM Eternal) but then couldn't complete the external redemption is fixed. Root cause: Microsoft moved the redemption UI from a network-API-driven flow (`store-web.dynamics.com/v1.0/Redeem/PrepareRedeem` + `RedeemToken`) to a fully client-side React app served from `www.microsoft.com/store/purchase/buynowui/`. The old `waitForResponse` for those endpoints timed out at 60s because MS no longer fires network calls at those hosts — the whole state machine runs in-iframe, with the iframe's URL slug as the signal.
+
+**Investigation (2026-09-27):** drove the full flow with @feldorn's DOOM Eternal code via a scratch investigator (`data/mstore-investigate.mjs`), capturing every network request + iframe URL transition + button state. Full network + UI capture archived in the report. Redemption succeeded live, confirming the observed flow works end-to-end.
+
+**Current MS Store flow (as of 2026-09-27):**
+
+| iframe URL slug | UI state |
+|---|---|
+| `.../buynowui/redeemnow` | `[name=tokenString]` input + disabled `Next` button |
+| `.../buynowui/redeem-confirm` | product info + `Cancel` / `Confirm` buttons |
+| `.../buynowui/redeem-success` | "You're good to go" + "X is ready for you" |
+| `.../buynowui/redeem-{err,fail,invalid,expired}` | error state (defensive — patterns matched, exact slug label unobserved) |
+
+**New helper:** `attemptMsStoreRedeem(page2, code)` in `src/platforms/prime-gaming.js` waits for iframe URL transitions instead of network responses. Fills code → waits for Next enabled → clicks → waits for iframe to leave `redeemnow` → dispatches by terminal slug:
+- `redeem-success` on Next → already-redeemed shortcut (rare)
+- `redeem-confirm` → click Confirm → wait for `redeem-success` → done
+- `redeem-err/fail/invalid/expired` → parse error text, mark DB `claimed:token-invalid` (terminal — stops re-nagging)
+- Anything else → unconfirmed state, DB stays `claimed`, still surfaces in Alerts
+
+**New flag: `PG_RETRY_PENDING=1`.** Self-heal path for entries already stuck in `data/prime-gaming.json` with status `claimed` (external redemption never completed). On each Prime run, retries the external redemption via `attemptMsStoreRedeem`. Successful retries flip to `claimed and redeemed` (terminal). Codes MS says are invalid flip to `claimed:token-invalid` (terminal). Anything ambiguous stays `claimed` and shows in the daily reminder.
+
+Default off — existing deploys keep the "capture code, tell user to redeem manually" behavior unless they opt in via env or `panel.pg.retryPending: true` in config.
+
+**Migration for existing stuck codes:** users on `PG_RETRY_PENDING=1` who already redeemed their pending code manually (typed it at `account.microsoft.com/billing/redeem` in a browser) will see MS report "already redeemed" on the next Prime run; fgc auto-flips the DB status and the daily nag stops without any user action.
+
+**Not changed:** GOG's `redeem.gog.com` API is stable and still uses the network-response flow. Xbox uses the same `www.microsoft.com/store/purchase/buynowui/` UI as MS Store, so the new helper covers both.
+
+---
+
 ## What's new in 2.12.2
 
 **Fix: Prime pending-redeem entries with status `'claimed'` now surface in the Alerts tab ([#155](https://github.com/feldorn/free-games-claimer/issues/155) @jcubby86).**
