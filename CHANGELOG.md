@@ -4,6 +4,26 @@ Release notes for [Feldorn's Free Games Claimer](README.md). Most recent at the 
 
 ---
 
+## What's new in 2.12.4
+
+**Fix: `PG_RETRY_PENDING` retries now heal codes MS rejects at client-side validation.**
+
+v2.12.3 shipped the `PG_RETRY_PENDING` self-heal loop for stuck MS Store codes. First live run against @feldorn's DOOM Eternal (already redeemed manually during the v2.12.3 investigator) reported `1 retried, 0 healed, 1 still pending` — helper returned `redeem (validation failed)` because Next never enabled (MS's client-side validation refused the already-consumed code), but that outcome had no `dbStatus` update, so the entry stayed at `claimed` and the daily nag continued. Regressed from the intended "retry-heals-terminal" behavior.
+
+**Fix:**
+
+1. **Body-text scan on validation-fail.** When Next doesn't enable within 10s, `attemptMsStoreRedeem` now reads the iframe body and pattern-matches for terminal indicators:
+   - "already own" / "already redeem" / "used by" / "is already" → `claimed and redeemed` (terminal)
+   - "expired" / "no longer valid" → `claimed:token-invalid` (terminal)
+   - "invalid" / "not recognized" / "check…code" → `claimed:token-invalid` (terminal)
+2. **Retry-path default.** When no hint text is present AND the helper was called from the `PG_RETRY_PENDING` loop (`isRetry: true`), assume the code was consumed since capture and mark `claimed and redeemed`. Reasoning: retry-pool codes were valid when Prime captured them; a later "no" from MS overwhelmingly means the code got consumed in the meantime (self, MS's own re-attempt, or user manual redemption). Fresh-code first-attempt path stays conservative (no dbStatus change) — a true invalid-code case there deserves the extra caution.
+
+**Result:** on the next Prime run with `PG_RETRY_PENDING=1`, @feldorn's DOOM Eternal flips to `claimed and redeemed` (terminal), drops out of the pending-notify list, disappears from the Alerts tab's Pending Redemptions section. Daily nag stops.
+
+Preserves the safer fresh-code behavior — a hypothetical first-time capture of a truly invalid code still surfaces as manual-verify, not silently marked terminal.
+
+---
+
 ## What's new in 2.12.3
 
 **Feature: MS Store / Xbox Prime-code auto-redemption rewritten against the current UI + new `PG_RETRY_PENDING=1` self-heal flag.**

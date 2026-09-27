@@ -163,20 +163,49 @@ try {
   // Contract: caller has ALREADY navigated page2 to the redemption URL
   // (or a login redirect check has been handled upstream). This function
   // only fills the code + drives the Next → Confirm flow.
-  async function attemptMsStoreRedeem(page2, code) {
+  async function attemptMsStoreRedeem(page2, code, { isRetry = false } = {}) {
     try {
       const iframe = page2.frameLocator('#redeem-iframe');
       const input = iframe.locator('[name=tokenString]');
       await input.waitFor({ timeout: 20000 });
       await input.fill(code);
       // Client-side validation runs on fill — Next enables when the code
-      // parses as a well-formed key (25 chars, checksum ok). If it never
-      // enables, the code is malformed OR the input didn't take.
+      // parses as a well-formed key AND MS's cache doesn't know it as
+      // already-used. If Next never enables, the code is either malformed
+      // or (much more likely) already consumed / expired.
       const nextBtn = iframe.locator('button:has-text("Next"):not([disabled])');
       try {
         await nextBtn.waitFor({ timeout: 10000 });
       } catch {
-        return { action: 'redeem (validation failed)', logLevel: 'warn', message: 'MS Store client-side validation rejected the code within 10s' };
+        // v2.12.4 (feldorn 2026-09-27 DOOM Eternal retry outcome):
+        // Scan the iframe body for text hints. MS's client-side
+        // validation sometimes surfaces an error message ("already used
+        // by another account", "expired", "invalid or already redeemed"
+        // etc.); when present, that lets us pick a specific terminal
+        // status instead of leaving the entry in perpetual pending limbo.
+        //
+        // When no hint text is visible AND we're in the retry path
+        // (isRetry=true), default to 'claimed and redeemed' — retry-pool
+        // codes were valid when Prime captured them, so a later "no"
+        // from MS overwhelmingly means the code got consumed in the
+        // meantime (self, MS's own re-attempt, or user manual redeem).
+        // Fresh-code path stays conservative (no dbStatus change) — a
+        // true invalid-code case there deserves the extra caution.
+        let bodyText = '';
+        try { bodyText = (await iframe.locator('body').innerText({ timeout: 3000 })).toLowerCase(); } catch { /* best-effort */ }
+        if (/already\s*(own|redeem|used)|owned by|used by|is already/.test(bodyText)) {
+          return { action: 'already redeemed', dbStatus: 'claimed and redeemed', logLevel: 'ok', message: `MS reports already redeemed (via validation error text)` };
+        }
+        if (/expired|no longer valid/.test(bodyText)) {
+          return { action: 'redeem (expired)', dbStatus: 'claimed:token-invalid', logLevel: 'warn', message: `MS reports code expired: ${bodyText.slice(0, 120)}` };
+        }
+        if (/invalid|not recognized|not a valid|check.*code/.test(bodyText)) {
+          return { action: 'redeem (invalid)', dbStatus: 'claimed:token-invalid', logLevel: 'warn', message: `MS reports invalid: ${bodyText.slice(0, 120)}` };
+        }
+        if (isRetry) {
+          return { action: 'already redeemed', dbStatus: 'claimed and redeemed', logLevel: 'ok', message: 'validation refused (retry path — assuming code was consumed since capture)' };
+        }
+        return { action: 'redeem (validation failed)', logLevel: 'warn', message: `MS Store client-side validation rejected the code within 10s${bodyText ? ' — body: ' + bodyText.slice(0, 80) : ''}` };
       }
       await nextBtn.click();
       // Wait for iframe to transition to a terminal sub-slug.
@@ -319,7 +348,7 @@ try {
           log.warn(`  ${dbTitle} — login redirect during retry, skipping`);
           continue;
         }
-        const out = await attemptMsStoreRedeem(page2, entry.code);
+        const out = await attemptMsStoreRedeem(page2, entry.code, { isRetry: true });
         if (out.dbStatus) {
           db.data[user][dbTitle].status = out.dbStatus;
           // Terminal statuses (contain 'redeemed' or 'invalid') will be
