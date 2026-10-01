@@ -22,7 +22,7 @@ jobs:
             - name: Checkout repository
               uses: actions/checkout@v7
               with:
-                  ref: main
+                  ref: dev
                   persist-credentials: false
 
             - name: Setup Node.js
@@ -45,7 +45,7 @@ jobs:
                   EG_PASSWORD: ${{ secrets.EG_PASSWORD }}
                   EG_OTPKEY: ${{ secrets.EG_OTPKEY }}
               run: |
-                  xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" node epic-games
+                  xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" node src/platforms/epic-games.js
 
             - name: Run Prime Gaming
               if: ${{ !cancelled() && steps.install.outcome == 'success' }}
@@ -53,7 +53,7 @@ jobs:
                   PG_EMAIL: ${{ secrets.PG_EMAIL }}
                   PG_PASSWORD: ${{ secrets.PG_PASSWORD }}
               run: |
-                  node prime-gaming
+                  node src/platforms/prime-gaming.js
 
             - name: Run GOG
               if: ${{ !cancelled() && steps.install.outcome == 'success' }}
@@ -61,4 +61,4 @@ jobs:
                   GOG_EMAIL: ${{ secrets.GOG_EMAIL }}
                   GOG_PASSWORD: ${{ secrets.GOG_PASSWORD }}
               run: |
-                  node gog
+                  node src/platforms/gog.js
