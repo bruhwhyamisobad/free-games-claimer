@@ -1,0 +1,198 @@
+name: Run Script
+
+on:
+    schedule:
+        - cron: '0 12 * * *'
+          timezone: 'America/Los_Angeles' # Runs every day at 12:00 PM Pacific Time
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+jobs:
+    run:
+        runs-on: ubuntu-24.04
+        timeout-minutes: 90
+
+        concurrency:
+            group: free-games-claimer
+            cancel-in-progress: false
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v7
+              with:
+                  ref: main
+                  persist-credentials: false
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v7
+              with:
+                  node-version: 24
+                  package-manager-cache: false
+
+            - name: Install dependencies and browser
+              id: install
+              run: |
+                  npm ci --omit=dev
+                  ./node_modules/.bin/patchright install chromium
+              timeout-minutes: 5
+
+            - name: Inject Prime Gaming cookies
+              id: inject-pg-cookies
+              if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+              env:
+                  PG_COOKIES_JSON: ${{ secrets.PG_COOKIES_JSON }}
+                  BROWSER_DIR: data/browser
+              run: |
+                  node --input-type=module <<'NODE'
+                  import { chromium } from 'patchright';
+
+                  const raw = process.env.PG_COOKIES_JSON;
+
+                  if (!raw) {
+                    throw new Error('Missing PG_COOKIES_JSON secret.');
+                  }
+
+                  let cookies;
+
+                  try {
+                    cookies = JSON.parse(raw);
+                  } catch {
+                    throw new Error('Invalid PG_COOKIES_JSON.');
+                  }
+
+                  if (!Array.isArray(cookies)) {
+                    throw new Error('Expected a Playwright cookie array.');
+                  }
+
+                  const now = Date.now() / 1000;
+
+                  cookies = cookies.filter(c =>
+                    c &&
+                    typeof c.name === 'string' &&
+                    typeof c.value === 'string' &&
+                    typeof c.domain === 'string' &&
+                    typeof c.path === 'string' &&
+                    /(^|\.)amazon\.com$/i.test(c.domain) &&
+                    (
+                      typeof c.expires !== 'number' ||
+                      c.expires <= 0 ||
+                      c.expires > now
+                    )
+                  );
+
+                  if (!cookies.length) {
+                    throw new Error('No valid Amazon cookies found.');
+                  }
+
+                  const context = await chromium.launchPersistentContext(
+                    process.env.BROWSER_DIR,
+                    { headless: true }
+                  );
+
+                  try {
+                    await context.addCookies(cookies);
+                  } finally {
+                    await context.close();
+                  }
+
+                  console.log(`Imported ${cookies.length} Amazon cookies.`);
+                  NODE
+              timeout-minutes: 5
+
+            - name: Run Prime Gaming
+              id: prime-gaming
+              if: ${{ !cancelled() && steps.install.outcome == 'success' && steps.inject-pg-cookies.outcome == 'success' }}
+              env:
+                  PG_EMAIL: ${{ secrets.PG_EMAIL }}
+                  PG_PASSWORD: ${{ secrets.PG_PASSWORD }}
+                  BROWSER_DIR: data/browser
+              run: |
+                  node src/platforms/prime-gaming.js
+
+            - name: Capture refreshed Prime Gaming cookies
+              id: capture-pg-cookies
+              if: ${{ !cancelled() && steps.prime-gaming.outcome == 'success' }}
+              env:
+                  BROWSER_DIR: data/browser
+                  COOKIE_OUTPUT_PATH: ${{ runner.temp }}/pg-cookies.json
+              run: |
+                  node --input-type=module <<'NODE'
+                  import { chromium } from 'patchright';
+                  import { writeFile } from 'node:fs/promises';
+
+                  const context = await chromium.launchPersistentContext(
+                    process.env.BROWSER_DIR,
+                    { headless: true }
+                  );
+
+                  try {
+                    const now = Date.now() / 1000;
+                    const cookies = (await context.cookies()).filter(c => {
+                      const domain = typeof c.domain === 'string'
+                        ? c.domain.replace(/^\./, '')
+                        : '';
+
+                      return (
+                        typeof c.name === 'string' &&
+                        typeof c.value === 'string' &&
+                        /^(?:[a-z0-9-]+\.)*amazon\.com$/i.test(domain) &&
+                        (
+                          typeof c.expires !== 'number' ||
+                          c.expires <= 0 ||
+                          c.expires > now
+                        )
+                      );
+                    });
+
+                    if (!cookies.length) {
+                      throw new Error('No valid Amazon cookies found to save.');
+                    }
+
+                    await writeFile(
+                      process.env.COOKIE_OUTPUT_PATH,
+                      `${JSON.stringify(cookies)}\n`,
+                      { mode: 0o600 }
+                    );
+
+                    console.log(`Captured ${cookies.length} Amazon cookies.`);
+                  } finally {
+                    await context.close();
+                  }
+                  NODE
+              timeout-minutes: 5
+
+            - name: Update Prime Gaming cookie secret
+              if: ${{ !cancelled() && steps.capture-pg-cookies.outcome == 'success' }}
+              env:
+                  GH_TOKEN: ${{ secrets.PG_SECRET_UPDATE_TOKEN }}
+                  COOKIE_FILE: ${{ runner.temp }}/pg-cookies.json
+              run: |
+                  set -euo pipefail
+                  trap 'rm -f "$COOKIE_FILE"' EXIT
+
+                  if [[ -z "${GH_TOKEN:-}" ]]; then
+                    echo "::error::Missing PG_SECRET_UPDATE_TOKEN repository secret."
+                    exit 1
+                  fi
+
+                  if [[ ! -s "$COOKIE_FILE" ]]; then
+                    echo "::error::Cookie export is missing or empty."
+                    exit 1
+                  fi
+
+                  gh secret set PG_COOKIES_JSON \
+                    --app actions \
+                    --repo "$GITHUB_REPOSITORY" \
+                    < "$COOKIE_FILE"
+
+                  echo "Updated PG_COOKIES_JSON for the next run."
+
+            - name: Run GOG
+              if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+              env:
+                  GOG_EMAIL: ${{ secrets.GOG_EMAIL }}
+                  GOG_PASSWORD: ${{ secrets.GOG_PASSWORD }}
+              run: |
+                  node src/platforms/gog.js
