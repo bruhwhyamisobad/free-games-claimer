@@ -38,6 +38,11 @@ jobs:
                   ./node_modules/.bin/patchright install chromium
               timeout-minutes: 5
 
+            - name: Install Apprise
+              run: |
+                  python3 -m pip install --break-system-packages --no-cache-dir apprise
+              timeout-minutes: 5
+
             - name: Inject Prime Gaming cookies
               id: inject-pg-cookies
               if: ${{ !cancelled() && steps.install.outcome == 'success' }}
@@ -108,6 +113,7 @@ jobs:
                   PG_EMAIL: ${{ secrets.PG_EMAIL }}
                   PG_PASSWORD: ${{ secrets.PG_PASSWORD }}
                   BROWSER_DIR: data/browser
+                  NOTIFY: ${{ secrets.NOTIFY }}
               run: |
                   node src/platforms/prime-gaming.js
 
@@ -129,6 +135,7 @@ jobs:
 
                   try {
                     const now = Date.now() / 1000;
+
                     const cookies = (await context.cookies()).filter(c => {
                       const domain = typeof c.domain === 'string'
                         ? c.domain.replace(/^\./, '')
@@ -194,5 +201,6 @@ jobs:
               env:
                   GOG_EMAIL: ${{ secrets.GOG_EMAIL }}
                   GOG_PASSWORD: ${{ secrets.GOG_PASSWORD }}
+                  NOTIFY: ${{ secrets.NOTIFY }}
               run: |
                   node src/platforms/gog.js
