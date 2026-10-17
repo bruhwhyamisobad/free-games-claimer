@@ -43,6 +43,73 @@ jobs:
                   python3 -m pip install --break-system-packages --no-cache-dir apprise
               timeout-minutes: 5
 
+            - name: Prepare live notification runner
+              run: |
+                  umask 077
+                  cat > "$RUNNER_TEMP/run-claimer.mjs" <<'NODE'
+                  import { spawn } from 'node:child_process';
+                  import { createInterface } from 'node:readline';
+                  import { setTimeout as delay } from 'node:timers/promises';
+
+                  const [claimer, script] = process.argv.slice(2);
+                  const originalNotify = process.env.NOTIFY || '';
+                  const discordUrls = originalNotify.split(/[\n,]+/).map(url => url.trim())
+                    .filter(url => ['discord', 'discords'].includes(url.split(':', 1)[0].toLowerCase()));
+
+                  let notify;
+                  let escapeHtml;
+                  if (discordUrls.length) {
+                    process.env.NOTIFY = discordUrls.join('\n');
+                    ({ notify, escapeHtml } = await import(`${process.env.GITHUB_WORKSPACE}/src/util.js`));
+                  } else {
+                    console.error('No Discord URL in NOTIFY; claimer output will not be forwarded.');
+                  }
+
+                  const child = spawn(process.execPath, [script], {
+                    env: { ...process.env, NOTIFY: originalNotify },
+                    stdio: ['inherit', 'pipe', 'pipe'],
+                  });
+                  let sends = Promise.resolve();
+                  let sendFailed = false;
+
+                  for (const [input, output] of [
+                    [child.stdout, process.stdout],
+                    [child.stderr, process.stderr],
+                  ]) {
+                    createInterface({ input }).on('line', line => {
+                      output.write(`${line}\n`);
+                      if (!notify || !line.trim()) return;
+
+                      const text = (`[${claimer}] ${line}`).replace(/@/g, '@\u200b');
+                      let body = '';
+                      let units = 0;
+                      for (const character of text) {
+                        if (units + character.length > 1780) break;
+                        body += character;
+                        units += character.length;
+                      }
+                      if (body.length < text.length) body += ' ... [truncated]';
+
+                      sends = sends.then(async () => {
+                        try {
+                          await notify(escapeHtml(body), { kind: 'action' });
+                        } catch {
+                          sendFailed = true;
+                        }
+                        await delay(500);
+                      });
+                    });
+                  }
+
+                  const exitCode = await new Promise((resolve, reject) => {
+                    child.once('error', reject);
+                    child.once('close', code => resolve(code ?? 1));
+                  });
+                  await sends;
+                  if (sendFailed) console.error('One or more live Discord log notifications failed.');
+                  process.exitCode = exitCode;
+                  NODE
+
             - name: Inject Prime Gaming cookies
               id: inject-pg-cookies
               if: ${{ !cancelled() && steps.install.outcome == 'success' }}
@@ -115,7 +182,7 @@ jobs:
                   BROWSER_DIR: data/browser
                   NOTIFY: ${{ secrets.NOTIFY }}
               run: |
-                  node src/platforms/prime-gaming.js
+                  node "$RUNNER_TEMP/run-claimer.mjs" "Prime Gaming" src/platforms/prime-gaming.js
 
             - name: Capture refreshed Prime Gaming cookies
               id: capture-pg-cookies
@@ -203,4 +270,4 @@ jobs:
                   GOG_PASSWORD: ${{ secrets.GOG_PASSWORD }}
                   NOTIFY: ${{ secrets.NOTIFY }}
               run: |
-                  node src/platforms/gog.js
+                  node "$RUNNER_TEMP/run-claimer.mjs" GOG src/platforms/gog.js

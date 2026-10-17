@@ -1,0 +1,17 @@
+
+Entering npm script environment at location:
+/workspaces/free-games-claimer
+Type 'exit' or ^D when finished
+
+
+> free-games-claimer@2.12.11 npx
+> 'create-config'
+
+[1m@eslint/create-config: v3.0.0[22m
+[?25l[36m?[39m [1mWhat do you want to lint?[22m [2m…[22m 
+[36m◉[39m [36m[4mJavaScript[24m[39m
+[90m◯[39m JSON
+[90m◯[39m JSON with comments
+[90m◯[39m JSON5
+[90m◯[39m Markdown
+[90m◯[39m CSS[6A[32G
