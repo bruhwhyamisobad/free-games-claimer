@@ -1,0 +1,54 @@
+name: Test Notifications
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Install Apprise
+        run: python3 -m pip install --break-system-packages --no-cache-dir apprise
+        timeout-minutes: 5
+
+      - name: Send test notification
+        env:
+          NOTIFY: ${{ secrets.NOTIFY }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${NOTIFY:-}" ]]; then
+            echo "::error::NOTIFY is empty or unavailable. Add it as a repository Actions secret."
+            exit 1
+          fi
+
+          mapfile -t urls < <(
+            printf '%s' "$NOTIFY" |
+              tr ',' '\n' |
+              sed 's/^[[:space:]]*//; s/[[:space:]]*$//' |
+              grep -v '^$'
+          )
+
+          if [[ ${#urls[@]} -eq 0 ]]; then
+            echo "::error::NOTIFY does not contain any Apprise URLs."
+            exit 1
+          fi
+
+          log_file="$RUNNER_TEMP/apprise-test.log"
+          trap 'rm -f "$log_file"' EXIT
+
+          if apprise "${urls[@]}" \
+            -t "Free Games Claimer notification test" \
+            -b "Test notification from the Free Games Claimer GitHub Actions workflow." \
+            >"$log_file" 2>&1; then
+            echo "Apprise accepted the test notification for ${#urls[@]} configured target(s)."
+          else
+            status=$?
+            echo "::error::Apprise failed with exit code $status. Output is suppressed to avoid exposing notification credentials; verify the NOTIFY URL format and provider credentials."
+            exit "$status"
+          fi
