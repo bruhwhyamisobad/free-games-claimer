@@ -1,10 +1,7 @@
 name: Run Script
 
 on:
-    schedule:
-        - cron: '0 12 * * *'
-          timezone: 'America/Los_Angeles' # Runs every day at 12:00 PM Pacific Time
-    workflow_dispatch:
+    
 
 permissions:
     contents: read
